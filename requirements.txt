@@ -1,0 +1,2 @@
+gliner>=0.2.7
+faster-whisper>=1.0.0
