@@ -1,77 +1,139 @@
+#!/usr/bin/env python3
 """
-text_chat.py — Interactive Text-to-Intent REPL
+text_chat.py — Interactive text REPL for testing the NLU pipeline.
 
-Type commands and see the full NLU pipeline output instantly.
-No audio/microphone needed.
-
-Usage:
-    python3 text_chat.py
-
-Type 'quit' or 'exit' to stop.
+Type commands and see the agent/tool classification + routing instantly.
+When required fields are missing, the system asks for them one by one.
 """
-
-from __future__ import annotations
 
 import logging
 import sys
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S",
 )
+logger = logging.getLogger(__name__)
 
-from src.nlu.extractor import IntentExtractor, PipelineResult
-from src.router.handler import route
+# Suppress noisy third-party loggers
+for name in ("transformers", "huggingface_hub", "urllib3"):
+    logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _pretty_field(field_name: str) -> str:
+    """Convert 'provider_name' → 'Provider Name'."""
+    return field_name.replace("_", " ").title()
+
+
+def _ask_missing_fields(result) -> bool:
+    """Interactively ask the user for each missing required field.
+
+    Returns True if all fields were filled, False if user cancelled.
+    """
+    print()
+    print("─" * 60)
+    print(f"  📋  I'm setting up: {result.action}")
+
+    if result.filled_args:
+        print("  Already have:")
+        for k, v in result.filled_args.items():
+            print(f"      ✓ {_pretty_field(k):20s} = {v!r}")
+
+    print("  Still need a few details:")
+    print("─" * 60)
+
+    for field in list(result.missing_fields):
+        pretty = _pretty_field(field)
+        try:
+            answer = input(f"  ❓ {pretty} ❯ ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  ⏹️  Cancelled.\n")
+            return False
+
+        if not answer:
+            print(f"      ⚠️  Skipping {pretty} (left empty)")
+            continue
+
+        # Fill the slot
+        result.filled_args[field] = answer
+        result.missing_fields.remove(field)
+        print(f"      ✓ {pretty} = {answer!r}")
+
+    print()
+    return True
 
 
 def main() -> None:
-    print("\n" + "▓" * 60)
+    from src.nlu.extractor import IntentExtractor
+    from src.router.handler import route, TOOL_DISPATCH
+
+    print()
+    print("▓" * 60)
     print("  AUSA HEALTH — Text-to-Intent REPL")
     print("  Type a command and press Enter.")
     print("  Type 'quit' or 'exit' to stop.")
-    print("▓" * 60 + "\n")
+    print("▓" * 60)
+    print()
 
     print("  ⏳  Loading GLiNER model …")
     nlu = IntentExtractor()
+    nlu._load_model()
     print("  ✅  Ready!\n")
 
     while True:
         try:
             text = input("You ❯ ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except (KeyboardInterrupt, EOFError):
             print("\n\n  🛑  Goodbye!\n")
             break
 
         if not text:
             continue
-        if text.lower() in ("quit", "exit", "q"):
+        if text.lower() in ("quit", "exit"):
             print("\n  🛑  Goodbye!\n")
             break
 
-        # Run NLU pipeline
-        result: PipelineResult = nlu.analyse(text)
+        result = nlu.analyse(text)
 
-        # Display results
-        print(f"\n  🏷️   Domain : {result.domain or '(none)'}")
+        # Display classification
+        agent_label = {
+            "receptionist": "🏥 Receptionist",
+            "nurse": "🩺 Nurse",
+            "doctor": "👨‍⚕️ Doctor",
+        }
+        print()
+        print(f"  🤖  Agent  : {agent_label.get(result.agent, '(none)')}")
         print(f"  🎯  Action : {result.action or '(none)'}")
         print(f"  🔧  Tool   : {result.tool_name or '(none)'}")
+
         if result.entities:
             print("  🔍  Entities:")
             for ent in result.entities:
-                print(f"      • {ent.label:18s} = {ent.text!r}  ({ent.score:.2f})")
+                print(f"      • {ent.label:22s} = {ent.text!r}  ({ent.score:.2f})")
+
         if result.filled_args:
             print("  📋  Filled:")
             for k, v in result.filled_args.items():
                 print(f"      ✓ {k} = {v!r}")
-        if result.missing_fields:
-            print("  ❗  Missing:")
-            for f in result.missing_fields:
-                print(f"      ✗ {f}")
 
-        # Route
-        route(result)
-        print()
+        # Route to handler
+        status = route(result)
+
+        # If missing fields, ask interactively then dispatch
+        if status == "missing":
+            filled = _ask_missing_fields(result)
+            if filled and not result.missing_fields:
+                # All fields collected — dispatch the handler
+                handler = TOOL_DISPATCH.get(result.action)
+                if handler:
+                    handler(result.filled_args)
+            elif filled:
+                # Some fields still empty (user skipped)
+                print("  ⚠️  Some fields were skipped — proceeding with partial data.")
+                handler = TOOL_DISPATCH.get(result.action)
+                if handler:
+                    handler(result.filled_args)
 
 
 if __name__ == "__main__":

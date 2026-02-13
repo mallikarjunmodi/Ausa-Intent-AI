@@ -1,279 +1,212 @@
+#!/usr/bin/env python3
 """
-test_run.py — Multi-Scenario Verification Script
+test_run.py — Automated test scenarios for the hierarchical agent pipeline.
 
-Validates the two-tier NLU pipeline with 8 scenarios covering:
-  • Routines  (create, view, delete)
-  • Profiles  (update)
-  • Appointments (create)
-  • Settings  (change)
-  • Fallback  (ambiguous input)
-  • Missing fields (create routine without time)
-
-Two execution modes:
-  • TEXT-ONLY MODE (default) — bypass ASR, feed strings directly
-  • AUDIO MODE — generate .wav files, run full pipeline
-
-Run:
-    python test_run.py              # text-only (quick validation)
-    python test_run.py --audio      # full pipeline with generated .wav
+Runs in text-only mode (no ASR needed). Tests all 3 agents and key tools.
 """
-
-from __future__ import annotations
 
 import logging
-import math
-import os
-import struct
 import sys
-import wave
+from typing import List, Tuple
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(name)-30s | %(levelname)-7s | %(message)s",
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test Scenarios
+# Test definitions: (description, input_text, expected_agent, expected_action)
 # ═══════════════════════════════════════════════════════════════════════════
 
-TEST_SCENARIOS = [
-    {
-        "name": "Scenario 1 — Create Routine",
-        "text": "Create a morning routine to check my blood pressure",
-        "expected_domain": "routines",
-        "expected_action": "create_routine",
-        "expected_entities": "vital=blood pressure, time=morning",
-    },
-    {
-        "name": "Scenario 2 — View Routines",
-        "text": "Show me my routines for this week",
-        "expected_domain": "routines",
-        "expected_action": "view_routines",
-        "expected_entities": "timeframe=this week",
-    },
-    {
-        "name": "Scenario 3 — Delete Routine",
-        "text": "Delete my blood pressure routine",
-        "expected_domain": "routines",
-        "expected_action": "delete_routine",
-        "expected_entities": "vital=blood pressure",
-    },
-    {
-        "name": "Scenario 4 — Update Profile",
-        "text": "Update my profile height to 180 cm",
-        "expected_domain": "profiles",
-        "expected_action": "update_profile",
-        "expected_entities": "height=180 cm",
-    },
-    {
-        "name": "Scenario 5 — Create Appointment",
-        "text": "Book an appointment with Dr. Smith on Monday",
-        "expected_domain": "appointments",
-        "expected_action": "create_appointment",
-        "expected_entities": "doctor=Dr. Smith, time=Monday",
-    },
-    {
-        "name": "Scenario 6 — Change Setting",
-        "text": "Turn on dark mode",
-        "expected_domain": "settings",
-        "expected_action": "change_setting",
-        "expected_entities": "setting=dark mode",
-    },
-    {
-        "name": "Scenario 7 — Fallback (Ambiguous)",
-        "text": "Hello, what can you do?",
-        "expected_domain": "(none)",
-        "expected_action": "fallback",
-        "expected_entities": "—",
-    },
-    {
-        "name": "Scenario 8 — Missing Fields (Create Routine, no time)",
-        "text": "Set up a daily reminder to take my medication",
-        "expected_domain": "routines",
-        "expected_action": "create_routine",
-        "expected_entities": "freq=daily, med=medication (should prompt for time)",
-    },
+TEST_CASES: List[Tuple[str, str, str, str]] = [
+    # ── Agent 1: Receptionist ─────────────────────────────────────────
+    (
+        "View profile",
+        "show me my profile",
+        "receptionist",
+        "profile.read",
+    ),
+    (
+        "Update profile name",
+        "change my name to Rahul",
+        "receptionist",
+        "profile.update",
+    ),
+    (
+        "Add allergy",
+        "add an allergy to peanuts, severity is high",
+        "receptionist",
+        "allergies.create",
+    ),
+    (
+        "View allergies",
+        "show my allergies",
+        "receptionist",
+        "allergies.read",
+    ),
+    (
+        "View care team",
+        "who is on my care team",
+        "receptionist",
+        "careTeam.read",
+    ),
+    (
+        "Add family member",
+        "invite my wife to family, email is wife@test.com",
+        "receptionist",
+        "family.create",
+    ),
+    (
+        "Create appointment with symptoms",
+        "I'm Shreya and I dont like to smile, create a consultation with doctor",
+        "receptionist",
+        "appointment.create",
+    ),
+    (
+        "View appointments",
+        "show my appointments this week",
+        "receptionist",
+        "appointment.read",
+    ),
+    (
+        "Change brightness",
+        "set brightness to 80%",
+        "receptionist",
+        "brightness.update",
+    ),
+    (
+        "View connected devices",
+        "show connected devices",
+        "receptionist",
+        "device.read",
+    ),
+
+    # ── Agent 2: Nurse ────────────────────────────────────────────────
+    (
+        "Take blood pressure test",
+        "take my blood pressure",
+        "nurse",
+        "takeTest",
+    ),
+    (
+        "Take ECG test",
+        "I want to do an ECG test",
+        "nurse",
+        "takeTest",
+    ),
+    (
+        "View vital history",
+        "what was my last blood pressure reading",
+        "nurse",
+        "vital.read",
+    ),
+    (
+        "View blood glucose history",
+        "show my blood glucose history for past week",
+        "nurse",
+        "vital.read",
+    ),
+
+    # ── Agent 3: Doctor ───────────────────────────────────────────────
+    (
+        "Create routine",
+        "create a blood pressure routine daily at 8 AM",
+        "doctor",
+        "routine.create",
+    ),
+    (
+        "View routines",
+        "show all my routines",
+        "doctor",
+        "routine.read",
+    ),
+    (
+        "Update meal times",
+        "set breakfast time to 8 AM",
+        "doctor",
+        "mealTimes.update",
+    ),
+    (
+        "Send message",
+        "send a message to my doctor",
+        "doctor",
+        "message.send",
+    ),
+
+    # ── Edge cases / Fallback ─────────────────────────────────────────
+    (
+        "Feeling sick appointment (symptom keywords)",
+        "Im rahul and im feeling sick, create an appointment",
+        "receptionist",
+        "appointment.create",
+    ),
+    (
+        "Ambiguous query (should not crash)",
+        "hello how are you",
+        None,
+        None,
+    ),
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Text-Only Mode — NLU → Router (no ASR)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_text_only_tests() -> None:
-    """Feed test strings directly into the NLU → Router pipeline."""
-    from src.nlu.extractor import IntentExtractor, PipelineResult
+def run_tests():
+    from src.nlu.extractor import IntentExtractor
     from src.router.handler import route
 
-    print("\n" + "█" * 60)
-    print("  TEXT-ONLY TEST MODE")
-    print("  (ASR bypassed — strings fed directly to NLU → Router)")
-    print("█" * 60)
+    print("\n" + "=" * 70)
+    print("  AUSA HEALTH — Pipeline Test Suite")
+    print("=" * 70)
+    print(f"  {len(TEST_CASES)} test cases\n")
 
-    # Initialise NLU model once for all scenarios
+    print("  ⏳  Loading GLiNER model …")
     nlu = IntentExtractor()
+    nlu._load_model()
+    print("  ✅  Ready!\n")
 
-    for scenario in TEST_SCENARIOS:
-        print("\n" + "─" * 60)
-        print(f"  🧪  {scenario['name']}")
-        print(f"  Input    : \"{scenario['text']}\"")
-        print(f"  Expected : domain={scenario['expected_domain']}"
-              f"  action={scenario['expected_action']}")
-        print(f"  Entities : {scenario['expected_entities']}")
-        print("─" * 60)
+    passed = 0
+    failed = 0
 
-        # --- Full NLU analysis ---------------------------------------------
-        result: PipelineResult = nlu.analyse(scenario["text"])
+    for i, (desc, text, exp_agent, exp_action) in enumerate(TEST_CASES, 1):
+        result = nlu.analyse(text)
 
-        print(f"  🏷️   Domain : {result.domain or '(none)'}")
-        print(f"  🎯  Action : {result.action or '(none)'}")
-        print(f"  🔧  Tool   : {result.tool_name or '(none)'}")
-        print("  🔍  Extracted Entities:")
-        if result.entities:
-            for ent in result.entities:
-                print(f"    • {ent.label:18s} = {ent.text!r:30s}  (score={ent.score:.4f})")
-        else:
-            print("    (none above threshold)")
-        print("  📋  Filled Args:")
+        agent_ok = result.agent == exp_agent
+        action_ok = result.action == exp_action
+        ok = agent_ok and action_ok
+
+        icon = "✅" if ok else "❌"
+        print(f"  {icon}  [{i:02d}] {desc}")
+        print(f"        Input  : \"{text}\"")
+        print(f"        Agent  : {result.agent!r:18s} {'✓' if agent_ok else '✗ expected ' + repr(exp_agent)}")
+        print(f"        Action : {result.action!r:18s} {'✓' if action_ok else '✗ expected ' + repr(exp_action)}")
+
         if result.filled_args:
-            for k, v in result.filled_args.items():
-                print(f"    ✓ {k:18s} = {v!r}")
-        else:
-            print("    (none)")
+            print(f"        Filled : {result.filled_args}")
         if result.missing_fields:
-            print("  ❗  Missing Required Fields:")
-            for f in result.missing_fields:
-                print(f"    ✗ {f}")
+            print(f"        Missing: {result.missing_fields}")
+        print()
 
-        # --- Routing -------------------------------------------------------
-        print("  Router output:")
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+
+        # Also route (to verify handlers don't crash)
         route(result)
 
-    print("\n" + "█" * 60)
-    print("  ALL TEXT-ONLY TESTS COMPLETE")
-    print("█" * 60 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Audio Mode — Full Pipeline (ASR → NLU → Router)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _generate_sine_wav(filepath: str, duration: float = 2.0, freq: float = 440.0) -> str:
-    """Generate a simple sine-wave .wav file (silence placeholder)."""
-    sample_rate = 16_000
-    n_samples = int(sample_rate * duration)
-    amplitude = 16_000
-
-    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-
-    with wave.open(filepath, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-
-        for i in range(n_samples):
-            sample = int(amplitude * math.sin(2.0 * math.pi * freq * i / sample_rate))
-            wf.writeframes(struct.pack("<h", sample))
-
-    logger.info("Generated placeholder .wav: %s", filepath)
-    return os.path.abspath(filepath)
-
-
-def run_audio_tests() -> None:
-    """Generate placeholder .wav files and run the full pipeline."""
-    from main import run_pipeline
-
-    print("\n" + "█" * 60)
-    print("  AUDIO TEST MODE")
-    print("  (Full pipeline: ASR → NLU → Router)")
-    print("█" * 60)
-
-    audio_dir = "test_audio"
-    wav_files = []
-
-    for i, scenario in enumerate(TEST_SCENARIOS):
-        filename = f"{audio_dir}/test_{i + 1}.wav"
-        path = _generate_sine_wav(filename, duration=2.0, freq=440.0 + i * 100)
-        wav_files.append(path)
-        print(f"  Generated: {path}")
-
-    print()
-    print("  ⚠️  NOTE: These are sine-wave placeholders, not real speech.")
-    print("  For genuine end-to-end tests, replace them with recorded .wav")
-    print("  files containing the commands listed in TEST_SCENARIOS.\n")
-
-    for wav_path, scenario in zip(wav_files, TEST_SCENARIOS):
-        print("─" * 60)
-        print(f"  🧪  {scenario['name']}")
-        print(f"  Audio    : {wav_path}")
-        print(f"  Expected : domain={scenario['expected_domain']}"
-              f"  action={scenario['expected_action']}")
-        print("─" * 60)
-
-        try:
-            run_pipeline(wav_path)
-        except (RuntimeError, Exception) as exc:
-            print(f"  ⚠️  Pipeline error (expected for sine-wave): {exc}")
-
-    print("\n" + "█" * 60)
-    print("  ALL AUDIO TESTS COMPLETE")
-    print("█" * 60 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# .wav Generation Instructions
-# ═══════════════════════════════════════════════════════════════════════════
-
-def print_wav_instructions() -> None:
-    """Print instructions for generating real speech .wav files."""
-    print("""
-╔══════════════════════════════════════════════════════════════╗
-║  HOW TO GENERATE REAL SPEECH .wav FILES FOR TESTING         ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  Option A — macOS `say` command (quickest):                  ║
-║                                                              ║
-║    say -o test_audio/create_routine.wav \\                    ║
-║        --data-format=LEI16@16000 \\                           ║
-║        "Create a morning routine to check my blood pressure" ║
-║                                                              ║
-║    say -o test_audio/view_routines.wav \\                     ║
-║        --data-format=LEI16@16000 \\                           ║
-║        "Show me my routines for this week"                   ║
-║                                                              ║
-║    say -o test_audio/appointment.wav \\                       ║
-║        --data-format=LEI16@16000 \\                           ║
-║        "Book an appointment with Dr Smith on Monday"         ║
-║                                                              ║
-║  Then run:                                                   ║
-║    python main.py test_audio/create_routine.wav              ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
-""")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
-    """Entry point — choose test mode via CLI flag."""
-    if "--audio" in sys.argv:
-        run_audio_tests()
-    elif "--help-wav" in sys.argv:
-        print_wav_instructions()
+    # ── Summary ───────────────────────────────────────────────────────
+    print("=" * 70)
+    total = passed + failed
+    print(f"  Results: {passed}/{total} passed, {failed} failed")
+    if failed == 0:
+        print("  🎉  All tests passed!")
     else:
-        run_text_only_tests()
+        print("  ⚠️   Some tests failed — review output above.")
+    print("=" * 70 + "\n")
 
-    # Always print generation instructions at the end
-    print_wav_instructions()
+    return failed == 0
 
 
 if __name__ == "__main__":
-    main()
+    success = run_tests()
+    sys.exit(0 if success else 1)

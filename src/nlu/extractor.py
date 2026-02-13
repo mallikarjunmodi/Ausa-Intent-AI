@@ -1,42 +1,31 @@
 """
-extractor.py — Two-Tier NLU Pipeline (GLiNER)
+extractor.py — Hierarchical NLU pipeline using GLiNER
 
-Implements a hierarchical intent classification + entity extraction system:
+Two-tier classification:
+  Tier 1 → Classify which Agent  (Receptionist / Nurse / Doctor)
+  Tier 2 → Classify which Tool   (e.g. appointment.create, takeTest, routine.read)
 
-  Tier 1  →  Domain classification (routines / profiles / appointments / settings)
-  Tier 2  →  Sub-action classification per domain (create / view / update / delete)
-  Entity  →  Slot filling with domain-specific entity labels
-  Slots   →  Map entities into Pydantic model fields + detect missing required fields
-
-Usage:
-    from src.nlu.extractor import IntentExtractor
-    nlu = IntentExtractor()
-    result = nlu.analyse("Create a morning routine to check my blood pressure")
-    print(result.domain, result.action, result.filled_args, result.missing_fields)
+Hybrid scoring combines GLiNER predictions with keyword matching
+so that strong keyword signals override weak GLiNER predictions.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from gliner import GLiNER
-
 from src.models.schemas import TOOL_REGISTRY
 
-# ---------------------------------------------------------------------------
-# Module-level logger
-# ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Data classes
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ---------------------------------------------------------------------------
-# Data contracts
-# ---------------------------------------------------------------------------
-@dataclass(frozen=True)
+@dataclass
 class ExtractedEntity:
-    """One GLiNER prediction."""
     label: str
     text: str
     score: float
@@ -44,252 +33,579 @@ class ExtractedEntity:
 
 @dataclass
 class PipelineResult:
-    """Full NLU output after two-tier classification + slot filling.
-
-    Attributes:
-        domain:         Top-level intent domain (e.g. "routines").
-        action:         Sub-action (e.g. "create_routine").
-        tool_name:      Function/tool to dispatch to (same as action).
-        filled_args:    Dict of successfully filled Pydantic model fields.
-        missing_fields: List of required fields still missing a value.
-        entities:       Raw extracted entities from GLiNER.
-        confidence:     Tier-1 classification confidence.
-        raw_text:       The original input text.
-    """
-    domain: Optional[str] = None
-    action: Optional[str] = None
-    tool_name: Optional[str] = None
+    """Complete output of the NLU pipeline."""
+    raw_text: str
+    agent: Optional[str] = None          # receptionist / nurse / doctor
+    action: Optional[str] = None         # e.g. appointment.create, takeTest
+    tool_name: Optional[str] = None      # same as action (for dispatch)
+    entities: List[ExtractedEntity] = field(default_factory=list)
     filled_args: Dict[str, Any] = field(default_factory=dict)
     missing_fields: List[str] = field(default_factory=list)
-    entities: List[ExtractedEntity] = field(default_factory=list)
     confidence: float = 0.0
-    raw_text: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Intent / Sub-action configuration
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Tier 1: Top-level domain labels for GLiNER
-DOMAIN_LABELS: List[str] = ["routines", "profiles", "appointments", "settings"]
-DOMAIN_THRESHOLD: float = 0.2  # Low threshold — short queries score low
+DEFAULT_MODEL: str = "urchade/gliner_medium-v2.1"
+DOMAIN_THRESHOLD: float = 0.25
+ENTITY_THRESHOLD: float = 0.35
 
-# Tier 2: Per-domain sub-action labels and their mapped tool names
+# ── Tier 1: Agent labels ─────────────────────────────────────────────────
+
+AGENT_LABELS: List[str] = [
+    "health management",
+    "health recording",
+    "health consultation",
+]
+
+AGENT_MAP: Dict[str, str] = {
+    "health management": "receptionist",
+    "health recording": "nurse",
+    "health consultation": "doctor",
+}
+
+# ── Tier 2: Per-agent tool labels and mapped tool names ───────────────────
+
 SUB_ACTION_CONFIG: Dict[str, Dict] = {
-    "routines": {
-        "labels": ["create routine", "view routine", "view result", "update routine", "delete routine"],
+    "receptionist": {
+        "labels": [
+            "read profile", "update profile", "open camera",
+            "verify phone", "verify email",
+            "read diagnosis", "create allergy", "read allergies",
+            "update allergy", "delete allergy",
+            "read care team",
+            "create family member", "read family", "update family member",
+            "delete family member", "view permissions",
+            "read wifi", "update brightness", "update text size",
+            "connect device", "read devices", "delete device",
+            "read notifications", "update notification",
+            "update smart prompt",
+            "read call settings", "update call settings",
+            "create appointment", "read appointments",
+            "update appointment", "delete appointment",
+        ],
         "intent_map": {
-            "create routine": "create_routine",
-            "view routine": "view_routines",
-            "view result": "view_result",
-            "update routine": "update_routine",
-            "delete routine": "delete_routine",
+            "read profile": "profile.read",
+            "update profile": "profile.update",
+            "open camera": "camera.open",
+            "verify phone": "profile.verifyPhone",
+            "verify email": "profile.verifyEmail",
+            "read diagnosis": "diagnosis.read",
+            "create allergy": "allergies.create",
+            "read allergies": "allergies.read",
+            "update allergy": "allergies.update",
+            "delete allergy": "allergies.delete",
+            "read care team": "careTeam.read",
+            "create family member": "family.create",
+            "read family": "family.read",
+            "update family member": "family.update",
+            "delete family member": "family.delete",
+            "view permissions": "family.permissionsSchema",
+            "read wifi": "wifi.read",
+            "update brightness": "brightness.update",
+            "update text size": "textSize.update",
+            "connect device": "device.connect",
+            "read devices": "device.read",
+            "delete device": "device.delete",
+            "read notifications": "notification.read",
+            "update notification": "notification.update",
+            "update smart prompt": "smartPrompt.update",
+            "read call settings": "callSettings.read",
+            "update call settings": "callSettings.update",
+            "create appointment": "appointment.create",
+            "read appointments": "appointment.read",
+            "update appointment": "appointment.update",
+            "delete appointment": "appointment.delete",
         },
-        "default_action": "view_routines",
+        "default_action": "profile.read",
     },
-    "profiles": {
-        "labels": ["view profile", "update profile"],
+    "nurse": {
+        "labels": [
+            "take test",
+            "read vitals", "read media", "delete media",
+        ],
         "intent_map": {
-            "view profile": "view_profile",
-            "update profile": "update_profile",
+            "take test": "takeTest",
+            "read vitals": "vital.read",
+            "read media": "media.read",
+            "delete media": "media.delete",
         },
-        "default_action": "view_profile",
+        "default_action": "vital.read",
     },
-    "appointments": {
-        "labels": ["create appointment", "view appointment", "cancel appointment"],
+    "doctor": {
+        "labels": [
+            "send message", "open camera", "attach file",
+            "create routine", "read routines",
+            "update routine", "delete routine",
+            "update meal times",
+        ],
         "intent_map": {
-            "create appointment": "create_appointment",
-            "view appointment": "view_appointments",
-            "cancel appointment": "cancel_appointment",
+            "send message": "message.send",
+            "open camera": "camera.open",
+            "attach file": "message.attach",
+            "create routine": "routine.create",
+            "read routines": "routine.read",
+            "update routine": "routine.update",
+            "delete routine": "routine.delete",
+            "update meal times": "mealTimes.update",
         },
-        "default_action": "view_appointments",
-    },
-    "settings": {
-        "labels": ["change setting", "view setting"],
-        "intent_map": {
-            "change setting": "change_setting",
-            "view setting": "view_settings",
-        },
-        "default_action": "view_settings",
+        "default_action": "routine.read",
     },
 }
 
-# Entity labels for slot filling (used in the entity extraction pass)
+# ── Entity labels for GLiNER extraction ───────────────────────────────────
+
 ENTITY_LABELS: List[str] = [
     "vital sign type",
     "time reference",
     "frequency",
     "doctor name",
-    "body metric",
     "person name",
+    "body metric",
     "setting name",
     "setting value",
     "location",
     "medication name",
     "symptom or complaint",
+    "device name",
+    "email address",
+    "phone number",
+    "meal type",
+    "test type",
+    "file type",
+    "allergen",
 ]
-ENTITY_THRESHOLD: float = 0.35
 
-# Mapping from entity labels → Pydantic field names (per tool)
+# ── Entity → field mapping per tool ───────────────────────────────────────
+
 ENTITY_TO_FIELD_MAP: Dict[str, Dict[str, str]] = {
-    # Routines
-    "create_routine": {
-        "vital sign type": "vital_test_type",
-        "time reference": "scheduled_time",
-        "frequency": "frequency",
-        "medication name": "routine_name",
-    },
-    "view_routines": {
-        "vital sign type": "category",
-        "time reference": "timeframe",
-        "frequency": "frequency",
-    },
-    "view_result": {
-        "vital sign type": "vital_type",
-        "time reference": "timeframe",
-        "body metric": "vital_type",
-    },
-    "update_routine": {
-        "vital sign type": "vital_test_type",
-        "time reference": "scheduled_time",
-        "frequency": "frequency",
-    },
-    "delete_routine": {
-        "vital sign type": "routine_name",
-    },
-    # Profiles
-    "view_profile": {
-        "body metric": "section",
-    },
-    "update_profile": {
+    # ── Agent 1: Receptionist ─────────────────────────────────────────
+    "profile.read": {},
+    "profile.update": {
         "person name": "name",
-        "body metric": "height",  # simplification; refined below
+        "body metric": "height",
     },
-    # Appointments
-    "create_appointment": {
-        "doctor name": "doctor_name",
-        "time reference": "date_time",
+    "camera.open": {},
+    "profile.verifyPhone": {"phone number": "otp"},
+    "profile.verifyEmail": {"email address": "token"},
+    "diagnosis.read": {},
+    "allergies.create": {
+        "allergen": "name",
+        "setting value": "severity",
+    },
+    "allergies.read": {},
+    "allergies.update": {
+        "allergen": "name",
+        "setting value": "severity",
+    },
+    "allergies.delete": {"allergen": "name"},
+    "careTeam.read": {},
+    "family.create": {"email address": "email"},
+    "family.read": {},
+    "family.update": {"person name": "short_name"},
+    "family.delete": {"person name": "member_id"},
+    "family.permissionsSchema": {},
+    "wifi.read": {},
+    "brightness.update": {"setting value": "level"},
+    "textSize.update": {"setting value": "size"},
+    "device.connect": {"device name": "device_id"},
+    "device.read": {},
+    "device.delete": {"device name": "device_id"},
+    "notification.read": {},
+    "notification.update": {
+        "setting name": "setting_name",
+        "setting value": "value",
+    },
+    "smartPrompt.update": {"setting value": "enabled"},
+    "callSettings.read": {},
+    "callSettings.update": {
+        "setting name": "setting_name",
+        "setting value": "value",
+    },
+    "appointment.create": {
+        "doctor name": "provider_name",
+        "time reference": "start_time",
         "location": "location",
         "symptom or complaint": "symptoms",
         "person name": "patient_name",
     },
-    "view_appointments": {
+    "appointment.read": {
         "time reference": "timeframe",
-        "doctor name": "doctor_name",
+        "doctor name": "provider_name",
     },
-    "cancel_appointment": {
-        "doctor name": "doctor_name",
-        "time reference": "date_time",
+    "appointment.update": {
+        "doctor name": "provider_name",
+        "time reference": "start_time",
     },
-    # Settings
-    "change_setting": {
-        "setting name": "setting_name",
-        "setting value": "setting_value",
+    "appointment.delete": {},
+    # ── Agent 2: Nurse ────────────────────────────────────────────────
+    "takeTest": {
+        "vital sign type": "test_type",
+        "test type": "test_type",
     },
-    "view_settings": {
-        "setting name": "setting_name",
+    "vital.read": {
+        "vital sign type": "vital_type",
+        "time reference": "timeframe",
+    },
+    "media.read": {
+        "time reference": "timeframe",
+        "file type": "media_type",
+    },
+    "media.delete": {},
+    # ── Agent 3: Doctor ───────────────────────────────────────────────
+    "message.send": {"person name": "content"},
+    "message.attach": {"file type": "file_type"},
+    "routine.create": {
+        "vital sign type": "type",
+        "time reference": "time",
+        "frequency": "frequency",
+        "medication name": "name",
+    },
+    "routine.read": {
+        "vital sign type": "category",
+        "time reference": "timeframe",
+    },
+    "routine.update": {
+        "vital sign type": "type",
+        "time reference": "time",
+        "frequency": "frequency",
+    },
+    "routine.delete": {},
+    "mealTimes.update": {
+        "meal type": "meal",
+        "time reference": "time",
     },
 }
 
-# Keyword fallbacks — used when GLiNER confidence is too low
-DOMAIN_KEYWORDS: Dict[str, List[str]] = {
-    "routines": [
-        "routine", "routines", "schedule", "reminder", "medication",
-        "blood pressure", "heart rate", "spo2", "ecg", "temperature",
-        "glucose", "vital", "monitor", "check", "measure", "reading",
+# ── Keyword fallbacks ─────────────────────────────────────────────────────
+# Normal keywords score 1 point each. Priority keywords score 3 points.
+
+AGENT_KEYWORDS: Dict[str, List[str]] = {
+    "receptionist": [
+        # Profile
+        "profile", "my info", "my name", "height", "weight", "avatar",
+        "phone", "email", "verify",
+        # Conditions
+        "allergy", "allergies", "diagnosis", "condition",
+        # Care Team
+        "care team", "care provider",
+        # Family
+        "family", "invite", "member", "permissions",
+        # Settings
+        "setting", "settings", "wifi", "brightness", "text size",
+        "font", "notification", "notifications",
+        "smart prompt", "call setting", "connected device",
+        "dark mode", "device",
+        # Appointments
+        "doctor", "dr.", "book",
+        "clinic", "visit", "checkup",
+        "sick", "ill", "unwell", "symptom", "symptoms",
+        "fever", "cough", "injury", "feeling",
+    ],
+    "nurse": [
+        "take test", "take my",
+        "blood pressure", "bp", "spo2", "blood oxygen", "oxygen",
+        "blood glucose", "glucose", "sugar",
+        "temperature", "body temperature", "temp",
+        "ecg", "ekg", "electrocardiogram",
+        "body sounds", "stethoscope", "lungs", "heart sounds",
+        "ent", "ear", "nose", "throat",
+        "vitals", "vital", "vital sign", "vital signs",
+        "reading", "readings", "result", "results",
+        "history", "past", "last", "previous",
+        "media", "recording", "recordings",
+    ],
+    "doctor": [
+        "health schedule",
+        "medication", "medicine", "pill", "tablet",
         "daily", "weekly", "morning", "evening",
-    ],
-    "profiles": [
-        "profile", "my info", "my name", "height", "weight",
-        "allergy", "allergies", "diagnosis", "care team", "family",
-    ],
-    "appointments": [
-        "appointment", "appointments", "doctor", "dr.", "book",
-        "clinic", "visit", "consultation", "checkup",
-        "sick", "feeling", "ill", "unwell", "symptom", "symptoms",
-        "pain", "ache", "fever", "cough", "injury",
-    ],
-    "settings": [
-        "setting", "settings", "dark mode", "brightness", "notification",
-        "notifications", "text size", "font", "display", "volume",
-        "privacy", "connected device",
+        "meal", "meal time", "breakfast", "lunch", "dinner",
+        "message", "send", "chat",
+        "attach", "attachment", "photo", "picture",
+        "remind", "reminder",
     ],
 }
 
-ACTION_KEYWORDS: Dict[str, List[str]] = {
-    "create": ["create", "set up", "add", "new", "start", "begin", "schedule", "book", "make", "remind", "record", "want", "log", "track", "measure"],
-    "view": ["show", "view", "display", "see", "look", "get", "list"],
-    "result": ["reading", "readings", "result", "results", "last", "past", "previous", "history", "was"],
-    "update": ["update", "change", "edit", "modify", "set", "turn", "switch", "enable", "disable"],
-    "delete": ["delete", "remove", "cancel", "stop", "end", "clear"],
+# Priority keywords: these score 3x to break agent ties.
+# They are exclusively associated with one agent.
+AGENT_PRIORITY_KEYWORDS: Dict[str, List[str]] = {
+    "receptionist": [
+        "appointment", "appointments", "consultation",
+    ],
+    "nurse": [],
+    "doctor": [
+        "routine", "routines",
+    ],
+}
+
+# ── Direct tool-keyword scoring ───────────────────────────────────────────
+# Each tool gets verb keywords + topic nouns.
+# Tier-2 scores every tool simultaneously rather than verb-type → first label.
+
+TOOL_KEYWORDS: Dict[str, Dict[str, List[str]]] = {
+    # ── Agent 1: Receptionist ─────────────────────────────────────────
+    "profile.read": {
+        "verbs": ["show", "view", "see", "get", "display", "what"],
+        "nouns": ["profile", "my info", "my name", "my details"],
+    },
+    "profile.update": {
+        "verbs": ["update", "change", "edit", "set", "modify"],
+        "nouns": ["profile", "my name", "name", "height", "weight", "avatar"],
+    },
+    "camera.open": {
+        "verbs": ["open", "take", "start"],
+        "nouns": ["camera", "photo", "picture", "selfie"],
+    },
+    "profile.verifyPhone": {
+        "verbs": ["verify", "confirm", "validate"],
+        "nouns": ["phone", "phone number", "otp"],
+    },
+    "profile.verifyEmail": {
+        "verbs": ["verify", "confirm", "validate"],
+        "nouns": ["email", "email address"],
+    },
+    "diagnosis.read": {
+        "verbs": ["show", "view", "see", "get", "what"],
+        "nouns": ["diagnosis", "diagnoses", "condition", "conditions"],
+    },
+    "allergies.create": {
+        "verbs": ["add", "create", "new", "log"],
+        "nouns": ["allergy", "allergies", "allergic"],
+    },
+    "allergies.read": {
+        "verbs": ["show", "view", "see", "get", "list", "what"],
+        "nouns": ["allergy", "allergies", "allergic"],
+    },
+    "allergies.update": {
+        "verbs": ["update", "change", "edit", "modify"],
+        "nouns": ["allergy", "allergies"],
+    },
+    "allergies.delete": {
+        "verbs": ["delete", "remove", "clear"],
+        "nouns": ["allergy", "allergies"],
+    },
+    "careTeam.read": {
+        "verbs": ["show", "view", "see", "get", "who", "list"],
+        "nouns": ["care team", "care provider", "provider", "doctor"],
+    },
+    "family.create": {
+        "verbs": ["add", "invite", "create", "new"],
+        "nouns": ["family", "member", "wife", "husband", "child", "parent"],
+    },
+    "family.read": {
+        "verbs": ["show", "view", "see", "get", "list"],
+        "nouns": ["family", "family members"],
+    },
+    "family.update": {
+        "verbs": ["update", "change", "edit", "modify"],
+        "nouns": ["family", "member"],
+    },
+    "family.delete": {
+        "verbs": ["remove", "delete"],
+        "nouns": ["family", "member"],
+    },
+    "family.permissionsSchema": {
+        "verbs": ["show", "view", "what", "get"],
+        "nouns": ["permissions", "access"],
+    },
+    "wifi.read": {
+        "verbs": ["show", "view", "check", "get"],
+        "nouns": ["wifi", "wi-fi", "network", "internet"],
+    },
+    "brightness.update": {
+        "verbs": ["set", "change", "update", "adjust", "increase", "decrease"],
+        "nouns": ["brightness", "screen brightness", "display"],
+    },
+    "textSize.update": {
+        "verbs": ["set", "change", "update", "adjust", "increase", "decrease"],
+        "nouns": ["text size", "font size", "font"],
+    },
+    "device.connect": {
+        "verbs": ["connect", "pair", "add", "link"],
+        "nouns": ["device", "bluetooth"],
+    },
+    "device.read": {
+        "verbs": ["show", "view", "list", "get", "see"],
+        "nouns": ["device", "devices", "connected device", "connected devices"],
+    },
+    "device.delete": {
+        "verbs": ["disconnect", "remove", "delete", "unpair"],
+        "nouns": ["device", "devices"],
+    },
+    "notification.read": {
+        "verbs": ["show", "view", "check", "get"],
+        "nouns": ["notification", "notifications"],
+    },
+    "notification.update": {
+        "verbs": ["update", "change", "set", "turn", "enable", "disable"],
+        "nouns": ["notification", "notifications"],
+    },
+    "smartPrompt.update": {
+        "verbs": ["update", "change", "set", "turn", "enable", "disable"],
+        "nouns": ["smart prompt", "prompts"],
+    },
+    "callSettings.read": {
+        "verbs": ["show", "view", "check", "get"],
+        "nouns": ["call setting", "call settings", "call"],
+    },
+    "callSettings.update": {
+        "verbs": ["update", "change", "set"],
+        "nouns": ["call setting", "call settings", "call"],
+    },
+    "appointment.create": {
+        "verbs": ["create", "book", "schedule", "make", "set up", "new"],
+        "nouns": ["appointment", "consultation", "visit", "checkup", "doctor",
+                  "sick", "feeling", "ill", "unwell", "symptom"],
+    },
+    "appointment.read": {
+        "verbs": ["show", "view", "see", "get", "list", "check", "what"],
+        "nouns": ["appointment", "appointments", "visit", "consultation"],
+    },
+    "appointment.update": {
+        "verbs": ["update", "change", "reschedule", "modify", "edit"],
+        "nouns": ["appointment", "visit", "consultation"],
+    },
+    "appointment.delete": {
+        "verbs": ["cancel", "delete", "remove"],
+        "nouns": ["appointment", "visit", "consultation"],
+    },
+    # ── Agent 2: Nurse ────────────────────────────────────────────────
+    "takeTest": {
+        "verbs": ["take", "do", "perform", "run", "measure", "start", "begin", "record", "want"],
+        "nouns": ["test", "blood pressure", "bp", "spo2", "blood oxygen",
+                  "blood glucose", "glucose", "ecg", "ekg", "temperature",
+                  "body sounds", "ent"],
+    },
+    "vital.read": {
+        "verbs": ["show", "view", "see", "get", "what", "check", "display"],
+        "nouns": ["vital", "vitals", "reading", "readings", "result", "results",
+                  "history", "blood pressure", "bp", "spo2", "glucose",
+                  "ecg", "temperature", "last", "past", "previous"],
+    },
+    "media.read": {
+        "verbs": ["show", "view", "see", "get", "list", "play"],
+        "nouns": ["media", "recording", "recordings", "audio", "video"],
+    },
+    "media.delete": {
+        "verbs": ["delete", "remove", "clear"],
+        "nouns": ["media", "recording", "recordings"],
+    },
+    # ── Agent 3: Doctor ───────────────────────────────────────────────
+    "message.send": {
+        "verbs": ["send", "write", "text", "tell", "contact"],
+        "nouns": ["message", "doctor", "chat"],
+    },
+    "message.attach": {
+        "verbs": ["attach", "upload", "share", "send"],
+        "nouns": ["file", "photo", "picture", "attachment", "document"],
+    },
+    "routine.create": {
+        "verbs": ["create", "add", "new", "set up", "start", "schedule", "make"],
+        "nouns": ["routine", "routines", "schedule", "reminder",
+                  "medication", "medicine", "pill"],
+    },
+    "routine.read": {
+        "verbs": ["show", "view", "see", "get", "list", "what", "check"],
+        "nouns": ["routine", "routines", "schedule", "health schedule"],
+    },
+    "routine.update": {
+        "verbs": ["update", "change", "edit", "modify"],
+        "nouns": ["routine", "routines", "schedule"],
+    },
+    "routine.delete": {
+        "verbs": ["delete", "remove", "cancel", "stop"],
+        "nouns": ["routine", "routines", "schedule"],
+    },
+    "mealTimes.update": {
+        "verbs": ["set", "change", "update", "adjust"],
+        "nouns": ["meal", "meal time", "breakfast", "lunch", "dinner"],
+    },
 }
 
 
-# ---------------------------------------------------------------------------
-# Core NLU class
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# Intent Extractor
+# ═══════════════════════════════════════════════════════════════════════════
+
 class IntentExtractor:
-    """Two-tier GLiNER intent classifier with entity slot filling."""
+    """GLiNER-powered NLU with keyword fallback."""
 
-    DEFAULT_MODEL: str = "urchade/gliner_medium-v2.1"
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model_name = model_name
+        self._model = None
 
-    def __init__(self, model_name: str = DEFAULT_MODEL) -> None:
-        logger.info("Loading GLiNER model: %s", model_name)
-        self._model: GLiNER = GLiNER.from_pretrained(model_name)
-        logger.info("GLiNER model loaded successfully.")
-
-    # -- Internal helpers ---------------------------------------------------
+    def _load_model(self):
+        if self._model is None:
+            from gliner import GLiNER
+            logger.info("Loading GLiNER model: %s", self.model_name)
+            self._model = GLiNER.from_pretrained(self.model_name)
+        return self._model
 
     def _gliner_predict(
-        self, text: str, labels: List[str], threshold: float
-    ) -> List[Dict]:
-        """Run GLiNER prediction and return raw results."""
-        return self._model.predict_entities(text, labels, threshold=threshold)
+        self, text: str, labels: List[str], threshold: float = 0.25
+    ) -> List[Dict[str, Any]]:
+        model = self._load_model()
+        try:
+            return model.predict_entities(text, labels, threshold=threshold)
+        except Exception as e:
+            logger.warning("GLiNER predict failed: %s", e)
+            return []
 
-    def _classify_domain_gliner(self, text: str) -> tuple[Optional[str], float]:
-        """Tier-1: Classify top-level domain using GLiNER."""
-        preds = self._gliner_predict(text, DOMAIN_LABELS, DOMAIN_THRESHOLD)
+    # ── Tier 1: Agent classification ──────────────────────────────────
+
+    def _classify_agent_gliner(self, text: str) -> tuple[Optional[str], float]:
+        preds = self._gliner_predict(text, AGENT_LABELS, 0.15)
         if not preds:
             return None, 0.0
-        # Pick highest-confidence prediction
         best = max(preds, key=lambda p: p["score"])
-        return best["text"].lower().strip(), best["score"]
+        agent = AGENT_MAP.get(best["label"])
+        return agent, best["score"]
 
-    def _classify_domain_keywords(self, text: str) -> Optional[str]:
-        """Fallback Tier-1: Classify domain via keyword matching."""
+    def _classify_agent_keywords(self, text: str) -> Optional[str]:
         lower = text.lower()
-        scores: Dict[str, int] = {}
-        for domain, keywords in DOMAIN_KEYWORDS.items():
+        scores: Dict[str, float] = {}
+        for agent, keywords in AGENT_KEYWORDS.items():
             score = sum(1 for kw in keywords if kw in lower)
-            if score > 0:
-                scores[domain] = score
+            # Priority keywords score 3x
+            priority_score = sum(
+                3 for kw in AGENT_PRIORITY_KEYWORDS.get(agent, []) if kw in lower
+            )
+            total = score + priority_score
+            if total > 0:
+                scores[agent] = total
         if not scores:
             return None
         return max(scores, key=scores.get)
 
-    def _classify_action_hybrid(
-        self, text: str, domain: str
-    ) -> tuple[Optional[str], float]:
-        """Tier-2: Hybrid sub-action classification.
+    # ── Tier 2: Tool classification (topic-aware) ─────────────────────
 
-        Combines GLiNER predictions with keyword scoring to avoid
-        GLiNER overriding strong keyword signals (e.g. 'record' → create).
-        """
-        config = SUB_ACTION_CONFIG.get(domain)
+    def _classify_tool_hybrid(
+        self, text: str, agent: str
+    ) -> tuple[Optional[str], float]:
+        """Score every tool by verb+noun keyword match, then blend with GLiNER."""
+        config = SUB_ACTION_CONFIG.get(agent)
         if not config:
             return None, 0.0
 
         lower = text.lower()
+        valid_tools = set(config["intent_map"].values())
 
-        # ── Keyword scoring ───────────────────────────────────────
-        kw_scores: Dict[str, int] = {}
-        for action_type, keywords in ACTION_KEYWORDS.items():
-            score = sum(1 for kw in keywords if kw in lower)
+        # ── Keyword scoring per tool ──────────────────────────────
+        tool_scores: Dict[str, float] = {}
+        for tool_name, kw_config in TOOL_KEYWORDS.items():
+            if tool_name not in valid_tools:
+                continue
+            verb_hits = sum(1 for v in kw_config["verbs"] if v in lower)
+            noun_hits = sum(1 for n in kw_config["nouns"] if n in lower)
+            # Nouns are more important than verbs (weight 2x)
+            score = verb_hits + (noun_hits * 2)
             if score > 0:
-                kw_scores[action_type] = score
+                tool_scores[tool_name] = score
 
-        best_kw_type = max(kw_scores, key=kw_scores.get) if kw_scores else None
-        best_kw_score = kw_scores.get(best_kw_type, 0) if best_kw_type else 0
+        best_kw_tool = max(tool_scores, key=tool_scores.get) if tool_scores else None
+        best_kw_score = tool_scores.get(best_kw_tool, 0) if best_kw_tool else 0
 
         # ── GLiNER scoring ────────────────────────────────────────
         preds = self._gliner_predict(text, config["labels"], 0.15)
@@ -301,60 +617,32 @@ class IntentExtractor:
             gliner_conf = best["score"]
 
         logger.info(
-            "Tier-2 hybrid: gliner=%r(%.3f)  keywords=%r(%d)",
-            gliner_action, gliner_conf, best_kw_type, best_kw_score,
+            "Tier-2 hybrid: gliner=%r(%.3f)  kw_best=%r(%.1f)",
+            gliner_action, gliner_conf, best_kw_tool, best_kw_score,
         )
 
         # ── Decision logic ────────────────────────────────────────
-        # If keywords have a strong signal (2+ matches) and disagree
-        # with GLiNER, trust keywords — GLiNER is unreliable for
-        # action verbs on short phrases.
-        kw_action = self._map_keyword_type_to_action(best_kw_type, config)
-
-        if best_kw_score >= 2 and kw_action != gliner_action:
+        # Keywords with strong signal (noun match = 2+ score) override GLiNER
+        if best_kw_score >= 3 and best_kw_tool != gliner_action:
             logger.info(
-                "Keywords override GLiNER: %r (kw_score=%d) beats %r (conf=%.3f)",
-                kw_action, best_kw_score, gliner_action, gliner_conf,
+                "Keywords override: %r (score=%.1f) beats %r (conf=%.3f)",
+                best_kw_tool, best_kw_score, gliner_action, gliner_conf,
             )
-            return kw_action, gliner_conf
+            return best_kw_tool, gliner_conf
 
-        # If GLiNER is confident, use it
+        # Confident GLiNER
         if gliner_action and gliner_conf >= 0.3:
             return gliner_action, gliner_conf
 
-        # Otherwise fall back to keywords
-        if kw_action:
-            return kw_action, gliner_conf
+        # Fall back to keyword best
+        if best_kw_tool:
+            return best_kw_tool, gliner_conf
 
         return config.get("default_action"), 0.0
 
-    @staticmethod
-    def _map_keyword_type_to_action(
-        action_type: Optional[str], config: Dict
-    ) -> Optional[str]:
-        """Map a keyword action type (create/view/result/update/delete)
-        to the domain-specific tool name."""
-        if action_type is None:
-            return None
-        action_type_to_label = {
-            "create": next((l for l in config["labels"] if "create" in l), None),
-            "view": next((l for l in config["labels"] if l.startswith("view") and "result" not in l), None),
-            "result": next((l for l in config["labels"] if "result" in l), None),
-            "update": next((l for l in config["labels"] if "update" in l or "change" in l), None),
-            "delete": next((l for l in config["labels"] if "delete" in l or "cancel" in l), None),
-        }
-        label = action_type_to_label.get(action_type)
-        if label:
-            return config["intent_map"].get(label)
-        # For domains without a 'result' sub-action, fall back to 'view'
-        if action_type == "result":
-            view_label = action_type_to_label.get("view")
-            if view_label:
-                return config["intent_map"].get(view_label)
-        return None
+    # ── Entity extraction ─────────────────────────────────────────────
 
     def _extract_entities(self, text: str) -> List[ExtractedEntity]:
-        """Extract named entities for slot filling."""
         preds = self._gliner_predict(text, ENTITY_LABELS, ENTITY_THRESHOLD)
         entities = [
             ExtractedEntity(
@@ -367,141 +655,109 @@ class IntentExtractor:
         entities.sort(key=lambda e: e.score, reverse=True)
         return entities
 
+    # ── Symptom heuristic ─────────────────────────────────────────────
+
     @staticmethod
     def _extract_symptoms_heuristic(text: str) -> Optional[str]:
-        """Extract symptoms/complaints from natural language using patterns.
-
-        Catches phrases GLiNER misses because they're conversational:
-          - "I don't like to smile"
-          - "I can't sleep at night"
-          - "I have pain in my back"
-          - "suffering from headaches"
-          - "my knee hurts"
-        """
-        import re
+        """Extract symptoms from conversational patterns."""
         lower = text.lower()
-
-        # Patterns that signal a symptom/complaint clause
         symptom_patterns = [
-            # "I don't/can't/couldn't ..."
             r"i\s+(?:don'?t|can'?t|couldn'?t|cannot|am not able to)\s+(.+?)(?:,|\.|$|create|book|schedule|make|set)",
-            # "I'm/Im feeling/having ..."
             r"i(?:'?m| am)\s+(?:feeling|having|experiencing)\s+(.+?)(?:,|\.|$|create|book|schedule|make|set)",
-            # "I have/feel/experience ..."
             r"i\s+(?:have|feel|experience|notice|get|got)\s+(.+?)(?:,|\.|$|create|book|schedule|make|set)",
-            # "suffering from / troubled by ..."
             r"(?:suffering|troubled|bothered)\s+(?:from|by|with)\s+(.+?)(?:,|\.|$|create|book|schedule|make|set)",
-            # "my ... hurts/aches/is swollen"
             r"my\s+(.+?\s+(?:hurts?|aches?|is\s+(?:swollen|sore|painful|stiff|numb)))",
-            # "pain in / problem with ..."
             r"(?:pain|ache|problem|issue|trouble|difficulty)\s+(?:in|with)\s+(.+?)(?:,|\.|$|create|book|schedule|make|set)",
         ]
-
         for pattern in symptom_patterns:
             match = re.search(pattern, lower)
             if match:
                 symptom = match.group(1).strip().rstrip(",. ")
-                if len(symptom) > 2:  # skip trivially short matches
-                    logger.info("Heuristic symptom extracted: %r", symptom)
+                if len(symptom) > 2:
+                    logger.info("Heuristic symptom: %r", symptom)
                     return symptom
-
         return None
+
+    # ── Slot filling ──────────────────────────────────────────────────
 
     def _fill_slots(
         self, action: str, entities: List[ExtractedEntity], text: str
     ) -> tuple[Dict[str, Any], List[str]]:
-        """Map extracted entities → Pydantic model fields.
-
-        Returns:
-            (filled_args, missing_fields)
-        """
         field_map = ENTITY_TO_FIELD_MAP.get(action, {})
         model_cls = TOOL_REGISTRY.get(action)
 
-        # Build filled_args from entity → field mapping
         filled: Dict[str, Any] = {}
         for ent in entities:
             field_name = field_map.get(ent.label)
             if field_name and field_name not in filled:
-                filled[field_name] = ent.text
+                value = ent.text
+                # Clean allergen text: "nuts allergy" → "nuts"
+                if ent.label == "allergen":
+                    import re
+                    value = re.sub(r"\s*\b(allergy|allergies|allergic)\b\s*", "", value, flags=re.IGNORECASE).strip()
+                filled[field_name] = value
 
         # Heuristic symptom fallback for appointment actions
-        if action in ("create_appointment", "view_appointments") and "symptoms" not in filled:
+        if action in ("appointment.create", "appointment.read") and "symptoms" not in filled:
             symptom = self._extract_symptoms_heuristic(text)
             if symptom:
                 filled["symptoms"] = symptom
 
-        # Check for missing required fields
+        # Check missing required fields
         missing: List[str] = []
         if model_cls:
             try:
                 instance = model_cls(**filled)
                 missing = instance.get_missing_required()
             except Exception:
-                # If model validation fails, just report all required as missing
                 missing = getattr(model_cls, "REQUIRED_FIELDS", [])
 
         return filled, missing
 
-    # -- Public API ---------------------------------------------------------
+    # ── Main pipeline ─────────────────────────────────────────────────
 
     def analyse(self, text: str) -> PipelineResult:
-        """Run the full two-tier NLU pipeline.
-
-        Steps:
-            1. Tier-1: Classify domain (GLiNER → keyword fallback)
-            2. Tier-2: Classify sub-action (GLiNER → keyword fallback)
-            3. Extract entities for slot filling
-            4. Fill Pydantic model slots + detect missing required fields
-
-        Args:
-            text: Raw input string (from ASR or direct input).
-
-        Returns:
-            A ``PipelineResult`` with domain, action, filled_args,
-            missing_fields, and raw entities.
-        """
         result = PipelineResult(raw_text=text)
 
-        # ── Tier 1: Domain classification ─────────────────────────────
-        domain, domain_conf = self._classify_domain_gliner(text)
-        logger.info("Tier-1 GLiNER: domain=%r  confidence=%.3f", domain, domain_conf)
+        # ── Tier 1: Agent classification (hybrid) ─────────────────
+        gliner_agent, agent_conf = self._classify_agent_gliner(text)
+        kw_agent = self._classify_agent_keywords(text)
+        logger.info(
+            "Tier-1: gliner=%r(%.3f)  keywords=%r",
+            gliner_agent, agent_conf, kw_agent,
+        )
 
-        # Validate against known domains
-        if domain and domain not in SUB_ACTION_CONFIG:
-            # GLiNER returned text that doesn't match a domain label —
-            # try fuzzy matching
-            for known_domain in DOMAIN_LABELS:
-                if domain in known_domain or known_domain in domain:
-                    domain = known_domain
-                    break
-            else:
-                logger.info("GLiNER domain %r not in known domains, falling back to keywords.", domain)
-                domain = None
+        # Always prefer keywords when they disagree with GLiNER
+        # (priority keywords ensure strong signal for appointment/routine)
+        if kw_agent and kw_agent != gliner_agent:
+            agent = kw_agent
+            logger.info("Tier-1: keywords override GLiNER → %r", agent)
+        elif gliner_agent and agent_conf >= DOMAIN_THRESHOLD:
+            agent = gliner_agent
+        elif kw_agent:
+            agent = kw_agent
+        else:
+            agent = gliner_agent
 
-        if domain is None or domain_conf < DOMAIN_THRESHOLD:
-            domain = self._classify_domain_keywords(text)
-            logger.info("Tier-1 keyword fallback: domain=%r", domain)
-
-        if domain is None:
-            logger.info("No domain classified — returning fallback result.")
+        if agent is None:
+            logger.info("No agent classified — returning fallback result.")
             return result
 
-        result.domain = domain
-        result.confidence = domain_conf
+        result.agent = agent
+        result.confidence = agent_conf
 
-        # ── Tier 2: Sub-action classification (hybrid) ─────────────────
-        action, action_conf = self._classify_action_hybrid(text, domain)
+        # ── Tier 2: Tool classification (hybrid) ──────────────────
+        action, action_conf = self._classify_tool_hybrid(text, agent)
         logger.info("Tier-2 result: action=%r  confidence=%.3f", action, action_conf)
 
         if action is None:
-            action = SUB_ACTION_CONFIG[domain].get("default_action")
-            logger.info("Using default action for domain %r: %r", domain, action)
+            action = SUB_ACTION_CONFIG[agent].get("default_action")
+            logger.info("Using default action for agent %r: %r", agent, action)
 
         result.action = action
         result.tool_name = action
 
-        # ── Entity extraction + slot filling ──────────────────────────
+        # ── Entity extraction + slot filling ──────────────────────
         entities = self._extract_entities(text)
         result.entities = entities
 

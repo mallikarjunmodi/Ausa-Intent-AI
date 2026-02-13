@@ -130,7 +130,7 @@ def main() -> None:
                     analysis: PipelineResult = nlu.analyse(result.text)
                     nlu_ms = (time.perf_counter() - t1) * 1000
 
-                    print(f"  🏷️   Domain: {analysis.domain or '(none)'}")
+                    print(f"  🤖  Agent:  {analysis.agent or '(none)'}")
                     print(f"  🎯  Action: {analysis.action or '(none)'}")
                     if analysis.entities:
                         for ent in analysis.entities:
