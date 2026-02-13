@@ -1,14 +1,13 @@
 """
-live_asr.py — Real-time Microphone → Text Transcription
+live_asr.py — Real-time Microphone → Intent Pipeline
 
-Captures audio from the system microphone in short chunks, feeds each
-chunk to faster-whisper, and prints the transcription to the terminal
-as you speak.
+Captures audio from the system microphone in short chunks, runs the
+full two-tier NLU pipeline (ASR → Domain → Action → Entities → Router).
 
 Usage:
-    python3 live_asr.py                # default 3-second chunks
+    python3 live_asr.py                # full pipeline (default)
     python3 live_asr.py --chunk 5      # 5-second chunks
-    python3 live_asr.py --full         # also run NLU + Router on each chunk
+    python3 live_asr.py --asr-only     # only ASR, skip NLU + Router
 
 Press Ctrl+C to stop.
 """
@@ -27,7 +26,7 @@ import numpy as np
 import sounddevice as sd
 
 from src.audio.transcriber import WhisperTranscriber
-from src.nlu.extractor import IntentExtractor, AnalysisResult
+from src.nlu.extractor import IntentExtractor, PipelineResult
 from src.router.handler import route
 
 # ---------------------------------------------------------------------------
@@ -48,14 +47,7 @@ CHANNELS: int = 1           # mono
 
 
 def record_chunk(duration: float) -> np.ndarray:
-    """Record a chunk of audio from the default microphone.
-
-    Args:
-        duration: Recording length in seconds.
-
-    Returns:
-        NumPy int16 array of shape (n_samples, 1).
-    """
+    """Record a chunk of audio from the default microphone."""
     print(f"  🎤  Listening for {duration:.0f}s … speak now!", flush=True)
     audio = sd.rec(
         int(SAMPLE_RATE * duration),
@@ -63,42 +55,35 @@ def record_chunk(duration: float) -> np.ndarray:
         channels=CHANNELS,
         dtype="int16",
     )
-    sd.wait()  # block until recording is complete
+    sd.wait()
     return audio
 
 
 def save_to_temp_wav(audio: np.ndarray) -> str:
-    """Write a NumPy audio array to a temporary .wav file.
-
-    Args:
-        audio: int16 NumPy array from sounddevice.
-
-    Returns:
-        Path to the temporary .wav file.
-    """
+    """Write a NumPy audio array to a temporary .wav file."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     with wave.open(tmp.name, "w") as wf:
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)          # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio.tobytes())
     return tmp.name
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Live microphone ASR")
+    parser = argparse.ArgumentParser(description="Live microphone pipeline")
     parser.add_argument(
         "--chunk", type=float, default=3.0,
         help="Duration of each recording chunk in seconds (default: 3)",
     )
     parser.add_argument(
-        "--full", action="store_true",
-        help="Run full pipeline (ASR → NLU → Router) on each chunk",
+        "--asr-only", action="store_true",
+        help="Only run ASR (skip NLU + Router)",
     )
     args = parser.parse_args()
 
     print("\n" + "▓" * 60)
-    print("  AUSA HEALTH — Live Microphone ASR")
+    print("  AUSA HEALTH — Live Microphone Pipeline")
     print("  Press Ctrl+C to stop")
     print("▓" * 60 + "\n")
 
@@ -108,7 +93,7 @@ def main() -> None:
     print("  ✅  Whisper ready.\n")
 
     nlu = None
-    if args.full:
+    if not args.asr_only:
         print("  ⏳  Loading GLiNER model …")
         nlu = IntentExtractor()
         print("  ✅  GLiNER ready.\n")
@@ -137,22 +122,27 @@ def main() -> None:
                 print(f"      (lang={result.language}, dur={result.duration:.1f}s)")
                 print(f"  ⏱️  ASR latency: {asr_ms:.0f}ms")
 
-                # 4. Optionally run NLU + Router
+                # 4. Run full NLU + Router pipeline
                 nlu_ms = 0.0
                 route_ms = 0.0
                 if nlu is not None:
                     t1 = time.perf_counter()
-                    analysis: AnalysisResult = nlu.analyse(result.text)
+                    analysis: PipelineResult = nlu.analyse(result.text)
                     nlu_ms = (time.perf_counter() - t1) * 1000
 
-                    print(f"  🎯  Intent: {analysis.intent or '(none)'}")
+                    print(f"  🏷️   Domain: {analysis.domain or '(none)'}")
+                    print(f"  🎯  Action: {analysis.action or '(none)'}")
                     if analysis.entities:
                         for ent in analysis.entities:
                             print(f"      {ent.label:18s} = {ent.text!r}  ({ent.score:.2f})")
-                    if analysis.sensor_target:
-                        print(f"      sensor_target = {analysis.sensor_target}")
-                    if analysis.timeframe:
-                        print(f"      timeframe     = {analysis.timeframe}")
+                    if analysis.filled_args:
+                        print("  📋  Filled:")
+                        for k, v in analysis.filled_args.items():
+                            print(f"      ✓ {k} = {v!r}")
+                    if analysis.missing_fields:
+                        print("  ❗  Missing:")
+                        for f in analysis.missing_fields:
+                            print(f"      ✗ {f}")
                     print(f"  ⏱️  NLU latency: {nlu_ms:.0f}ms")
 
                     # Route

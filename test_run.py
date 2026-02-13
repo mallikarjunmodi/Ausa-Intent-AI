@@ -1,16 +1,17 @@
 """
-test_run.py — Three-Scenario Verification Script
+test_run.py — Multi-Scenario Verification Script
 
-Validates the full Voice-to-Intent pipeline with:
-  1. "View result"     → should route to mock_view_result()
-  2. "Create routine"  → should route to mock_create_routine()
-  3. Ambiguous input   → should trigger mock_fallback_prompt()
+Validates the two-tier NLU pipeline with 8 scenarios covering:
+  • Routines  (create, view, delete)
+  • Profiles  (update)
+  • Appointments (create)
+  • Settings  (change)
+  • Fallback  (ambiguous input)
+  • Missing fields (create routine without time)
 
 Two execution modes:
-  • TEXT-ONLY MODE (default) — bypass ASR and feed strings directly
-    into the NLU → Router stages.  No .wav files needed.
-  • AUDIO MODE — generate .wav files with Python's `wave` module,
-    then run the full Audio → Text → Intent → Action pipeline.
+  • TEXT-ONLY MODE (default) — bypass ASR, feed strings directly
+  • AUDIO MODE — generate .wav files, run full pipeline
 
 Run:
     python test_run.py              # text-only (quick validation)
@@ -43,19 +44,60 @@ logger = logging.getLogger(__name__)
 
 TEST_SCENARIOS = [
     {
-        "name": "Scenario 1 — View Result",
-        "text": "Show me my blood pressure results from last week",
-        "expected": "mock_view_result()  (target=blood pressure, timeframe=last week)",
+        "name": "Scenario 1 — Create Routine",
+        "text": "Create a morning routine to check my blood pressure",
+        "expected_domain": "routines",
+        "expected_action": "create_routine",
+        "expected_entities": "vital=blood pressure, time=morning",
     },
     {
-        "name": "Scenario 2 — Create Routine",
-        "text": "Set up a morning routine to check my blood pressure",
-        "expected": "mock_create_routine()  (target=blood pressure, timeframe=morning)",
+        "name": "Scenario 2 — View Routines",
+        "text": "Show me my routines for this week",
+        "expected_domain": "routines",
+        "expected_action": "view_routines",
+        "expected_entities": "timeframe=this week",
     },
     {
-        "name": "Scenario 3 — Ambiguous / Fallback",
+        "name": "Scenario 3 — Delete Routine",
+        "text": "Delete my blood pressure routine",
+        "expected_domain": "routines",
+        "expected_action": "delete_routine",
+        "expected_entities": "vital=blood pressure",
+    },
+    {
+        "name": "Scenario 4 — Update Profile",
+        "text": "Update my profile height to 180 cm",
+        "expected_domain": "profiles",
+        "expected_action": "update_profile",
+        "expected_entities": "height=180 cm",
+    },
+    {
+        "name": "Scenario 5 — Create Appointment",
+        "text": "Book an appointment with Dr. Smith on Monday",
+        "expected_domain": "appointments",
+        "expected_action": "create_appointment",
+        "expected_entities": "doctor=Dr. Smith, time=Monday",
+    },
+    {
+        "name": "Scenario 6 — Change Setting",
+        "text": "Turn on dark mode",
+        "expected_domain": "settings",
+        "expected_action": "change_setting",
+        "expected_entities": "setting=dark mode",
+    },
+    {
+        "name": "Scenario 7 — Fallback (Ambiguous)",
         "text": "Hello, what can you do?",
-        "expected": "mock_fallback_prompt()  (no intent keywords matched)",
+        "expected_domain": "(none)",
+        "expected_action": "fallback",
+        "expected_entities": "—",
+    },
+    {
+        "name": "Scenario 8 — Missing Fields (Create Routine, no time)",
+        "text": "Set up a daily reminder to take my medication",
+        "expected_domain": "routines",
+        "expected_action": "create_routine",
+        "expected_entities": "freq=daily, med=medication (should prompt for time)",
     },
 ]
 
@@ -65,12 +107,8 @@ TEST_SCENARIOS = [
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_text_only_tests() -> None:
-    """Feed test strings directly into the NLU → Router pipeline.
-
-    This bypasses the ASR stage entirely, allowing rapid validation
-    of intent extraction and routing logic without audio files.
-    """
-    from src.nlu.extractor import IntentExtractor, AnalysisResult
+    """Feed test strings directly into the NLU → Router pipeline."""
+    from src.nlu.extractor import IntentExtractor, PipelineResult
     from src.router.handler import route
 
     print("\n" + "█" * 60)
@@ -85,21 +123,33 @@ def run_text_only_tests() -> None:
         print("\n" + "─" * 60)
         print(f"  🧪  {scenario['name']}")
         print(f"  Input    : \"{scenario['text']}\"")
-        print(f"  Expected : {scenario['expected']}")
+        print(f"  Expected : domain={scenario['expected_domain']}"
+              f"  action={scenario['expected_action']}")
+        print(f"  Entities : {scenario['expected_entities']}")
         print("─" * 60)
 
         # --- Full NLU analysis ---------------------------------------------
-        result: AnalysisResult = nlu.analyse(scenario["text"])
+        result: PipelineResult = nlu.analyse(scenario["text"])
 
-        print(f"  Intent: {result.intent or '(none)'}")
-        print("  Extracted Entities:")
+        print(f"  🏷️   Domain : {result.domain or '(none)'}")
+        print(f"  🎯  Action : {result.action or '(none)'}")
+        print(f"  🔧  Tool   : {result.tool_name or '(none)'}")
+        print("  🔍  Extracted Entities:")
         if result.entities:
             for ent in result.entities:
                 print(f"    • {ent.label:18s} = {ent.text!r:30s}  (score={ent.score:.4f})")
         else:
             print("    (none above threshold)")
-        print(f"  sensor_target = {result.sensor_target or '(none)'}")
-        print(f"  timeframe     = {result.timeframe or '(none)'}")
+        print("  📋  Filled Args:")
+        if result.filled_args:
+            for k, v in result.filled_args.items():
+                print(f"    ✓ {k:18s} = {v!r}")
+        else:
+            print("    (none)")
+        if result.missing_fields:
+            print("  ❗  Missing Required Fields:")
+            for f in result.missing_fields:
+                print(f"    ✗ {f}")
 
         # --- Routing -------------------------------------------------------
         print("  Router output:")
@@ -115,29 +165,16 @@ def run_text_only_tests() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _generate_sine_wav(filepath: str, duration: float = 2.0, freq: float = 440.0) -> str:
-    """Generate a simple sine-wave .wav file (silence placeholder).
-
-    These files are NOT real speech — they exist so you can verify that
-    the ASR stage loads and processes audio without crashing.  For genuine
-    end-to-end testing you need real speech recordings.
-
-    Args:
-        filepath:  Output .wav path.
-        duration:  Length in seconds.
-        freq:      Sine frequency in Hz.
-
-    Returns:
-        The absolute path to the generated file.
-    """
-    sample_rate = 16_000  # 16 kHz — Whisper's native rate
+    """Generate a simple sine-wave .wav file (silence placeholder)."""
+    sample_rate = 16_000
     n_samples = int(sample_rate * duration)
-    amplitude = 16_000    # ~50 % of int16 max
+    amplitude = 16_000
 
     os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
 
     with wave.open(filepath, "w") as wf:
-        wf.setnchannels(1)          # mono
-        wf.setsampwidth(2)          # 16-bit
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
 
         for i in range(n_samples):
@@ -149,13 +186,7 @@ def _generate_sine_wav(filepath: str, duration: float = 2.0, freq: float = 440.0
 
 
 def run_audio_tests() -> None:
-    """Generate placeholder .wav files and run the full pipeline.
-
-    ⚠️  The sine-wave files do NOT contain speech.  Whisper will likely
-    produce garbled or empty transcriptions.  This mode is primarily
-    useful for verifying the ASR module initialises and runs without
-    errors.  For real E2E testing, record actual voice commands.
-    """
+    """Generate placeholder .wav files and run the full pipeline."""
     from main import run_pipeline
 
     print("\n" + "█" * 60)
@@ -166,7 +197,6 @@ def run_audio_tests() -> None:
     audio_dir = "test_audio"
     wav_files = []
 
-    # Generate placeholder .wav files
     for i, scenario in enumerate(TEST_SCENARIOS):
         filename = f"{audio_dir}/test_{i + 1}.wav"
         path = _generate_sine_wav(filename, duration=2.0, freq=440.0 + i * 100)
@@ -178,17 +208,17 @@ def run_audio_tests() -> None:
     print("  For genuine end-to-end tests, replace them with recorded .wav")
     print("  files containing the commands listed in TEST_SCENARIOS.\n")
 
-    # Run pipeline on each file
     for wav_path, scenario in zip(wav_files, TEST_SCENARIOS):
         print("─" * 60)
         print(f"  🧪  {scenario['name']}")
         print(f"  Audio    : {wav_path}")
-        print(f"  Expected : {scenario['expected']}")
+        print(f"  Expected : domain={scenario['expected_domain']}"
+              f"  action={scenario['expected_action']}")
         print("─" * 60)
 
         try:
             run_pipeline(wav_path)
-        except (RuntimeError, Exception) as exc:  # noqa: BLE001
+        except (RuntimeError, Exception) as exc:
             print(f"  ⚠️  Pipeline error (expected for sine-wave): {exc}")
 
     print("\n" + "█" * 60)
@@ -209,32 +239,20 @@ def print_wav_instructions() -> None:
 ║                                                              ║
 ║  Option A — macOS `say` command (quickest):                  ║
 ║                                                              ║
-║    say -o test_audio/view_result.wav \\                       ║
-║        --data-format=LEI16@16000 \\                           ║
-║        "Show me my blood pressure results from last week"    ║
-║                                                              ║
 ║    say -o test_audio/create_routine.wav \\                    ║
 ║        --data-format=LEI16@16000 \\                           ║
-║        "Set up a morning routine to check my blood pressure" ║
+║        "Create a morning routine to check my blood pressure" ║
 ║                                                              ║
-║    say -o test_audio/ambiguous.wav \\                         ║
+║    say -o test_audio/view_routines.wav \\                     ║
 ║        --data-format=LEI16@16000 \\                           ║
-║        "Hello what can you do"                               ║
+║        "Show me my routines for this week"                   ║
 ║                                                              ║
-║  Option B — Python gTTS (requires internet):                 ║
-║                                                              ║
-║    pip install gTTS pydub                                    ║
-║    from gtts import gTTS                                     ║
-║    tts = gTTS("Show me my blood pressure results")           ║
-║    tts.save("test_audio/view_result.mp3")                    ║
-║    # Then convert mp3 → wav with ffmpeg or pydub             ║
-║                                                              ║
-║  Option C — Record with your microphone:                     ║
-║                                                              ║
-║    Use any recorder, save as 16 kHz, 16-bit, mono WAV.      ║
+║    say -o test_audio/appointment.wav \\                       ║
+║        --data-format=LEI16@16000 \\                           ║
+║        "Book an appointment with Dr Smith on Monday"         ║
 ║                                                              ║
 ║  Then run:                                                   ║
-║    python main.py test_audio/view_result.wav                 ║
+║    python main.py test_audio/create_routine.wav              ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)

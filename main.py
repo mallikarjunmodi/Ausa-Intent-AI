@@ -3,8 +3,8 @@ main.py — Central Orchestrator
 
 Wires the Audio → Text → Intent → Action pipeline:
     1. WhisperTranscriber  :  .wav  →  raw text
-    2. IntentExtractor     :  text  →  AnalysisResult (intent + entities)
-    3. Router              :  result →  mock action
+    2. IntentExtractor     :  text  →  PipelineResult (domain + action + entities)
+    3. Router              :  result →  tool call or missing-field prompt
 
 Run:
     python main.py path/to/audio.wav
@@ -16,7 +16,7 @@ import logging
 import sys
 
 from src.audio.transcriber import WhisperTranscriber, TranscriptionResult
-from src.nlu.extractor import IntentExtractor, AnalysisResult
+from src.nlu.extractor import IntentExtractor, PipelineResult
 from src.router.handler import route
 
 # ---------------------------------------------------------------------------
@@ -58,22 +58,32 @@ def run_pipeline(audio_path: str) -> None:
     print(f"    Duration      : {transcript.duration:.2f}s\n")
 
     # ── Stage 2 : NLU ─────────────────────────────────────────────────
-    logger.info("━━━  Stage 2 / 3 : Text → Intent + Entities  (GLiNER + Keywords)  ━━━")
+    logger.info("━━━  Stage 2 / 3 : Text → Domain + Action + Entities  (GLiNER)  ━━━")
     nlu: IntentExtractor = IntentExtractor()
-    result: AnalysisResult = nlu.analyse(transcript.text)
+    result: PipelineResult = nlu.analyse(transcript.text)
 
-    print(f"🎯  Intent : {result.intent or '(none)'}")
+    print(f"🏷️   Domain : {result.domain or '(none)'}")
+    print(f"🎯  Action : {result.action or '(none)'}")
+    print(f"🔧  Tool   : {result.tool_name or '(none)'}")
     print("🔍  Extracted Entities:")
     if result.entities:
         for ent in result.entities:
             print(f"    • {ent.label:18s} = {ent.text!r:30s}  (score={ent.score:.4f})")
     else:
         print("    (none above confidence threshold)")
-    print(f"    sensor_target = {result.sensor_target or '(none)'}")
-    print(f"    timeframe     = {result.timeframe or '(none)'}")
+    print("📋  Filled Args:")
+    if result.filled_args:
+        for k, v in result.filled_args.items():
+            print(f"    ✓ {k:18s} = {v!r}")
+    else:
+        print("    (none)")
+    if result.missing_fields:
+        print("❗  Missing Required Fields:")
+        for f in result.missing_fields:
+            print(f"    ✗ {f}")
 
     # ── Stage 3 : Router ──────────────────────────────────────────────
-    logger.info("━━━  Stage 3 / 3 : Result → Action  (Router)  ━━━")
+    logger.info("━━━  Stage 3 / 3 : Result → Tool Call  (Router)  ━━━")
     route(result)
 
     print("▓" * 60)
